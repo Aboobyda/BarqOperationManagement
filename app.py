@@ -112,7 +112,6 @@ DRIVER_NAME_MAP = {
     "أبو بكر": "أبو بكر",
 }
 
-# دالة حازمة لتطهير النصوص من أي رموز ASCII الخفية التي يرفضها openpyxl
 def sanitize_text(val):
     if pd.isna(val) or val is None:
         return ""
@@ -126,9 +125,21 @@ def sanitize_text(val):
                 val = val.decode("utf-8", errors="ignore")
     
     text = str(val).strip()
-    # حذف رموز التحكم غير الصالحة في XML / Excel
     text = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]', '', text)
     return text
+
+def parse_num(val, default=0.0):
+    txt = sanitize_text(val)
+    if not txt:
+        return default
+    # استخراج أول أرقام مجمعة
+    match = re.search(r'(\d+(?:\.\d+)?)', txt)
+    if match:
+        try:
+            return float(match.group(1))
+        except:
+            return default
+    return default
 
 
 def get_db_connection():
@@ -137,16 +148,19 @@ def get_db_connection():
     return conn
 
 
-# 2. تحميل البيانات
+# 2. تحميل البيانات وتصحيح المبالغ المالية فورياً
 @st.cache_data(ttl=60)
 def load_data():
     if not os.path.exists(DB_PATH):
-        st.error("⚠️ لم يتم العثور على قاعدة البيانات! يرجى تشغيل سكريبت migrate.py أولاً.")
+        st.error("⚠️ لم يتم العثور على قاعدة البيانات! يرجى تشغيل سكريبت المزامنة أولاً.")
         return pd.DataFrame(), [], [], [], [], [], []
 
     conn = get_db_connection()
     df = pd.read_sql_query("SELECT * FROM trips ORDER BY id ASC", conn)
     
+    if "original_id" in df.columns:
+        df["id"] = df["original_id"]
+
     df = df.rename(columns={
         "id": "الرقم",
         "company": "اسم الشركة",
@@ -165,28 +179,30 @@ def load_data():
         "month": "الشهر"
     })
 
-    df["سعر_الرحلة_رقم"] = pd.to_numeric(df["سعر الرحلة"], errors="coerce").fillna(0)
-    df["مبلغ_السائق_رقم"] = pd.to_numeric(df["مبلغ السائق"], errors="coerce").fillna(15)
+    # استخراج مالي رقمي نقي ومطهر من الأحرف والرموز الغريبة
+    df["سعر_الرحلة_رقم"] = df["سعر الرحلة"].apply(lambda x: parse_num(x, 0.0))
+    df["مبلغ_السائق_رقم"] = df["مبلغ السائق"].apply(lambda x: parse_num(x, 15.0))
+
+    # إعادة تنسيق العرض الرقمي بشكل نظيف
+    df["سعر الرحلة"] = df["سعر_الرحلة_رقم"].apply(lambda x: f"{x:.0f}" if x > 0 else "")
+    df["مبلغ السائق"] = df["مبلغ_السائق_رقم"].apply(lambda x: f"{x:.0f}" if x > 0 else "15")
 
     string_cols = ["اسم الشركة", "اليوم", "التاريخ", "المخلفه", "السائق", "رقم اللوحة", 
-                   "كمية المخلفات", "المعدة", "سعر الرحلة", "مبلغ السائق", "السند", "محطة الاتلاف", "الملاحظات", "الشهر"]
+                   "كمية المخلفات", "المعدة", "السند", "محطة الاتلاف", "الملاحظات", "الشهر"]
     for col in string_cols:
         if col in df.columns:
             df[col] = df[col].apply(sanitize_text)
 
-    def fetch_list_merged(table_name, df_col_name):
-        res_db = pd.read_sql_query(f"SELECT name FROM {table_name}", conn)
-        db_items = [sanitize_text(x) for x in res_db["name"].dropna().tolist() if sanitize_text(x)]
-        df_items = [sanitize_text(x) for x in df[df_col_name].dropna().unique().tolist() if sanitize_text(x)]
-        all_items = sorted(list(set([x for x in db_items + df_items if x not in ["nan", "الكل", ""]])))
-        return all_items
+    def fetch_list_from_db(table_name):
+        res_db = pd.read_sql_query(f"SELECT name FROM {table_name} ORDER BY name ASC", conn)
+        return [sanitize_text(x) for x in res_db["name"].dropna().tolist() if sanitize_text(x)]
 
-    companies_list = fetch_list_merged("companies", "اسم الشركة")
-    wastes_list = fetch_list_merged("wastes", "المخلفه")
-    drivers_list = fetch_list_merged("drivers", "السائق")
-    equipments_list = fetch_list_merged("equipments", "المعدة")
-    stations_list = fetch_list_merged("stations", "محطة الاتلاف")
-    plates_list = fetch_list_merged("plates", "رقم اللوحة")
+    companies_list = fetch_list_from_db("companies")
+    wastes_list = fetch_list_from_db("wastes")
+    drivers_list = fetch_list_from_db("drivers")
+    equipments_list = fetch_list_from_db("equipments")
+    stations_list = fetch_list_from_db("stations")
+    plates_list = fetch_list_from_db("plates")
 
     conn.close()
     return df, companies_list, wastes_list, drivers_list, equipments_list, stations_list, plates_list
@@ -204,14 +220,12 @@ ALL_DISPLAY_COLUMNS = [
 VALID_ALL_COLS = [c for c in ALL_DISPLAY_COLUMNS if c in df.columns]
 
 
-# دالة التصدير إلى Excel المعالجة لحظر IllegalCharacterError
 def convert_df_to_excel(df_to_export, cols_order):
     output = io.BytesIO()
     export_df = df_to_export.copy()
     valid_cols = [c for c in cols_order if c in export_df.columns]
     export_df = export_df[valid_cols]
 
-    # تنظيف جميع الخلايا النصية قبل كتابتها بالملف
     for col in export_df.columns:
         export_df[col] = export_df[col].apply(sanitize_text)
 
@@ -439,7 +453,7 @@ elif menu == "➕ إضافة رحلة جديدة":
                 conn = get_db_connection()
                 cursor = conn.cursor()
                 cursor.execute("""
-                    INSERT INTO trips (id, company, day, date, waste_type, driver, plate, quantity, equipment, amount, driver_fee, receipt, station, notes, month)
+                    INSERT INTO trips (original_id, company, day, date, waste_type, driver, plate, quantity, equipment, amount, driver_fee, receipt, station, notes, month)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     next_id, sanitize_text(company_input), sanitize_text(calculated_day), date_input.strftime("%d/%m/%Y"),
@@ -744,8 +758,8 @@ elif menu == "📂 قاعدة البيانات الموحدة":
                     e_qty = st.text_input("الكمية:", value=sanitize_text(row_data["كمية المخلفات"]))
                     e_equip = st.selectbox("المعدة:", equipments_list, index=equipments_list.index(sanitize_text(row_data["المعدة"])) if sanitize_text(row_data["المعدة"]) in equipments_list else 0)
                 with e_col3:
-                    e_amount = st.text_input("سعر الرحلة:", value=sanitize_text(row_data["سعر الرحلة"]))
-                    e_driver_fee = st.text_input("مبلغ السائق:", value=sanitize_text(row_data["مبلغ السائق"]) if sanitize_text(row_data["مبلغ السائق"]) else "15")
+                    e_amount = st.number_input("سعر الرحلة (ريال):", min_value=0.0, value=parse_num(row_data["سعر الرحلة"], 0.0), step=50.0)
+                    e_driver_fee = st.number_input("مبلغ السائق (ريال):", min_value=0.0, value=parse_num(row_data["مبلغ السائق"], 15.0), step=5.0)
                     e_receipt = st.text_input("السند:", value=sanitize_text(row_data["السند"]))
                     e_station = st.selectbox("محطة الاتلاف:", stations_list, index=stations_list.index(sanitize_text(row_data["محطة الاتلاف"])) if sanitize_text(row_data["محطة الاتلاف"]) in stations_list else 0)
 
@@ -764,11 +778,11 @@ elif menu == "📂 قاعدة البيانات الموحدة":
                     cursor.execute("""
                         UPDATE trips SET 
                         company=?, day=?, date=?, waste_type=?, driver=?, plate=?, quantity=?, equipment=?, amount=?, driver_fee=?, receipt=?, station=?, notes=?, month=?
-                        WHERE id=?
+                        WHERE id=? OR original_id=?
                     """, (
                         sanitize_text(e_comp), sanitize_text(e_calculated_day), formatted_e_date, sanitize_text(e_waste), sanitize_text(DRIVER_NAME_MAP.get(e_driver, e_driver)),
-                        sanitize_text(e_plate), sanitize_text(e_qty), sanitize_text(e_equip), sanitize_text(e_amount), sanitize_text(e_driver_fee), sanitize_text(e_receipt), sanitize_text(e_station),
-                        sanitize_text(e_notes) if e_notes else None, extracted_e_month, trip_id
+                        sanitize_text(e_plate), sanitize_text(e_qty), sanitize_text(e_equip), e_amount, e_driver_fee, sanitize_text(e_receipt), sanitize_text(e_station),
+                        sanitize_text(e_notes) if e_notes else None, extracted_e_month, trip_id, trip_id
                     ))
                     conn.commit()
                     conn.close()
@@ -791,7 +805,7 @@ elif menu == "📂 قاعدة البيانات الموحدة":
         if col_yes.button("✅ نعم، تأكيد الحذف النهائي"):
             conn = get_db_connection()
             cursor = conn.cursor()
-            cursor.execute("DELETE FROM trips WHERE id=?", (del_id,))
+            cursor.execute("DELETE FROM trips WHERE id=? OR original_id=?", (del_id, del_id))
             conn.commit()
             conn.close()
 
