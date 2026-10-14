@@ -132,7 +132,6 @@ def parse_num(val, default=0.0):
     txt = sanitize_text(val)
     if not txt:
         return default
-    # استخراج أول أرقام مجمعة
     match = re.search(r'(\d+(?:\.\d+)?)', txt)
     if match:
         try:
@@ -148,7 +147,7 @@ def get_db_connection():
     return conn
 
 
-# 2. تحميل البيانات وتصحيح المبالغ المالية فورياً
+# 2. تحميل البيانات
 @st.cache_data(ttl=60)
 def load_data():
     if not os.path.exists(DB_PATH):
@@ -179,11 +178,9 @@ def load_data():
         "month": "الشهر"
     })
 
-    # استخراج مالي رقمي نقي ومطهر من الأحرف والرموز الغريبة
     df["سعر_الرحلة_رقم"] = df["سعر الرحلة"].apply(lambda x: parse_num(x, 0.0))
     df["مبلغ_السائق_رقم"] = df["مبلغ السائق"].apply(lambda x: parse_num(x, 15.0))
 
-    # إعادة تنسيق العرض الرقمي بشكل نظيف
     df["سعر الرحلة"] = df["سعر_الرحلة_رقم"].apply(lambda x: f"{x:.0f}" if x > 0 else "")
     df["مبلغ السائق"] = df["مبلغ_السائق_رقم"].apply(lambda x: f"{x:.0f}" if x > 0 else "15")
 
@@ -382,7 +379,7 @@ if menu == "📊 لوحة التحكم الإحصائية":
         st.plotly_chart(fig_d, use_container_width=True)
 
 # ---------------------------------------------------------
-# 2. إضافة رحلة جديدة
+# 2. إضافة رحلة جديدة (مع إخلاء التلقائي للحقول بعد الحفظ)
 # ---------------------------------------------------------
 elif menu == "➕ إضافة رحلة جديدة":
     st.title("➕ تسجيل رحلة جديدة في قاعدة البيانات")
@@ -407,7 +404,10 @@ elif menu == "➕ إضافة رحلة جديدة":
     opt_equipments = ["اختر نوع المعدة..."] + equipments_list
     opt_stations = ["اختر محطة الاتلاف..."] + stations_list
 
-    with st.form("add_trip_main_form"):
+    # مفتاح ديناميكي للنموذج يُحدث تلقائياً لإخلاء جميع الحقول بعد الحفظ
+    form_ver = st.session_state.get("add_form_version", 0)
+
+    with st.form(f"add_trip_main_form_{form_ver}"):
         col_a, col_b, col_c = st.columns(3)
         with col_a:
             st.number_input("الرقم (تلقائي):", value=next_id, disabled=True)
@@ -465,6 +465,9 @@ elif menu == "➕ إضافة رحلة جديدة":
                 ))
                 conn.commit()
                 conn.close()
+
+                # زيادة رقم الإصدار لإعادة تعيين النموذج وإخلاء كافة الحقول
+                st.session_state["add_form_version"] = form_ver + 1
 
                 st.toast("✅ تم إضافة الرحلة وحفظها بنجاح!", icon="🎉")
                 st.cache_data.clear()
